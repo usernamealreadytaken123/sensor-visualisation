@@ -4,102 +4,96 @@
 import socket
 import json
 import threading
+import queue
 import logging
-from typing import Callable, Optional, Dict, Any
-
-logger = logging.getLogger(__name__)
+# Настройка локального логирования для отладки сетевых пакетов
+logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] (%(threadName)s) %(message)s')
 
 class UDPReceiver:
-    def __init__(self, host: str = "0.0.0.0", port: int = 5005, buffer_size: int = 1024):
-        self.host = host
+    def __init__(self, ip: str, port: int, data_queue: queue.Queue):
+        """
+        Класс для асинхронного приема телеметрии IMU по протоколу UDP.
+        
+        :param ip: IP-адрес для прослушивания (например, '0.0.0.0' для всех интерфейсов)
+        :param port: UDP-порт (например, 5005)
+        :param data_queue: Потокобезопасная очередь queue.Queue для передачи пакетов в UI
+        """
+        self.ip = ip
         self.port = port
-        self.buffer_size = buffer_size
-        self._socket: Optional[socket.socket] = None
-        self._running = False
-        self._thread: Optional[threading.Thread] = None
-        self._callback: Optional[Callable[[Dict[str, Any]], None]] = None
-        self.packets_received = 0
-        self.packets_parsed = 0
-        self.packets_errors = 0
-
-    def set_callback(self, callback: Callable[[Dict[str, Any]], None]) -> None:
-        self._callback = callback
-
-    def start(self) -> bool:
-        if self._running:
-            logger.warning("Приёмник уже запущен")
-            return False
-        try:
-            self._socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            self._socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            self._socket.bind((self.host, self.port))
-            self._socket.settimeout(0.5)
-            self._running = True
-            self._thread = threading.Thread(target=self._receive_loop, daemon=True)
-            self._thread.start()
-            logger.info(f"UDP-приёмник запущен на {self.host}:{self.port}")
-            return True
-        except Exception as e:
-            logger.error(f"Ошибка запуска UDP-приёмника: {e}")
-            return False
-
-    def stop(self) -> None:
-        if not self._running:
+        self.data_queue = data_queue
+        
+        self.sock = None
+        self.is_running = False
+        self.thread = None
+        
+    def start(self):
+        """Инициализация сокета и запуск приёма данных в фоновом демоническом потоке."""
+        if self.is_running:
+            logging.warning("UDP-приёмник уже запущен.")
             return
-        self._running = False
-        if self._socket:
-            try:
-                self._socket.close()
-            except Exception:
-                pass
-            self._socket = None
-        if self._thread and self._thread.is_alive():
-            self._thread.join(timeout=1.0)
-        logger.info("UDP-приёмник остановлен")
+            
+        try:
+            # Создаем UDP сокет (SOCK_DGRAM)
+            self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            
+            # Позволяет операционной системе повторно использовать порт сразу после закрытия
+            self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            
+            # Привязываем сокет к IP и Порту
+            self.sock.bind((self.ip, self.port))
+            
+            # Устанавливаем таймаут блокирующих операций (recvfrom) в 1 секунду.
+            # Это критически важно, чтобы при вызове stop() поток завершался, а не зависал вечно.
+            self.sock.settimeout(1.0) 
+            
+        except Exception as e:
+            logging.error(f"Не удалось инициализировать UDP сокет на {self.ip}:{self.port}. Ошибка: {e}")
+            if self.sock:
+                self.sock.close()
+            raise e
+            
+        # Устанавливаем флаг работы и запускаем фоновый поток
+        self.is_running = True
+        self.thread = threading.Thread(target=self._listen_loop, name="UDP_Receiver_Thread", daemon=True)
+        self.thread.start()
+        logging.info(f"Сетевой поток UDP успешно запущен на {self.ip}:{self.port}")
 
-    def _receive_loop(self) -> None:
-        while self._running and self._socket:
+    def stop(self):
+        """Безопасная остановка сетевого потока и закрытие ресурсов сокета."""
+        if not self.is_running:
+            return
+            
+        logging.info("Остановка сетевого потока UDP")
+        self.is_running = False
+        
+        # Ожидаем завершения фонового потока (максимум 1.5 секунды)
+        if self.thread:
+            self.thread.join(timeout=1.5)
+            self.thread = None
+            
+        # Закрываем сетевой сокет
+        if self.sock:
             try:
-                data, addr = self._socket.recvfrom(self.buffer_size)
-                self.packets_received += 1
-                try:
-                    json_str = data.decode('utf-8').strip()
-                    packet = json.loads(json_str)
-                    if self._validate_packet(packet):
-                        self.packets_parsed += 1
-                        if self._callback:
-                            self._callback(packet)
-                    else:
-                        self.packets_errors += 1
-                        logger.warning(f"Невалидный пакет от {addr}")
-                except (json.JSONDecodeError, UnicodeDecodeError) as e:
-                    self.packets_errors += 1
-                    logger.warning(f"Ошибка парсинга от {addr}: {e}")
+                self.sock.close()
+            except Exception as e:
+                logging.error(f"Ошибка при закрытии сокета: {e}")
+            self.sock = None
+            
+        logging.info("Сетевой поток UDP полностью остановлен.")
+
+    def _listen_loop(self):
+        while self.is_running:
+            try:
+                # Читаем ровно 4096 байт
+                data, addr = self.sock.recvfrom(4096)
+                packet = json.loads(data.decode('utf-8'))
+                
+                # Упрощаем проверку: если есть хоть какие-то данные, кидаем в очередь
+                if "accel" in packet:
+                    self.data_queue.put_nowait(packet)
             except socket.timeout:
                 continue
             except Exception as e:
-                logger.error(f"Ошибка в цикле приёма: {e}")
+                if self.is_running:
+                    print(f"ОШИБКА В ПОТОКЕ ПРИЕМА: {e}") # Прямой вывод в консоль
                 break
-        logger.info("Цикл приёма завершён")
-
-    def _validate_packet(self, packet: dict) -> bool:
-        required_fields = ['packet_id', 'timestamp', 'accel', 'gyro', 'quat']
-        if not all(field in packet for field in required_fields):
-            return False
-        for subfield in ['accel', 'gyro']:
-            if not isinstance(packet[subfield], dict):
-                return False
-            if not all(axis in packet[subfield] for axis in ['x', 'y', 'z']):
-                return False
-        if not isinstance(packet['quat'], dict):
-            return False
-        if not all(axis in packet['quat'] for axis in ['w', 'x', 'y', 'z']):
-            return False
-        return True
-
-    def get_stats(self) -> dict:
-        return {
-            'packets_received': self.packets_received,
-            'packets_parsed': self.packets_parsed,
-            'packets_errors': self.packets_errors,
-        }

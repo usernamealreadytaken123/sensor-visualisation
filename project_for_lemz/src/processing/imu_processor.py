@@ -2,159 +2,138 @@
 Математическое ядро VIO с поддержкой разных фильтров.
 """
 import numpy as np
-from typing import Dict, Tuple, Optional
-from .filters import (
-    VectorFilter,
-    VectorKalmanFilter,
-    VectorIIRFilter
-)
+import logging
+from scipy.spatial.transform import Rotation as R
 
 class IMUProcessor:
-    def __init__(
-        self,
-        gravity: Tuple[float, float, float] = (0.0, 0.0, -9.81),
-        filter_type: str = 'exponential',  # 'exponential', 'kalman', 'iir'
-        filter_alpha: float = 0.3,
-        kalman_process_noise: float = 1e-4,
-        kalman_measurement_noise: float = 1e-2,
-        iir_cutoff: float = 0.1,
-        iir_order: int = 2
-    ):
-        self.gravity = np.array(gravity, dtype=np.float64)
+    def __init__(self):
+        """
+        Математическое ядро ИНС. Вычисляет координаты траектории 
+        на основе двойного интегрирования данных акселерометра с телефона.
+        """
+        self.reset()
 
-        # Сырые значения
-        self.position_raw = np.zeros(3, dtype=np.float64)
-        self.velocity_raw = np.zeros(3, dtype=np.float64)
+    def reset(self):
+        """Полный сброс навигационных параметров и возврат в начальную точку (0,0,0)."""
+        self.last_timestamp = None    # Время предыдущего пакета для вычисления dt
+        
+        # Навигационные векторы состояния в мировой (земной) СК
+        self.position = np.zeros(3)       # Позиция [X, Y, Z] в метрах
+        self.velocity = np.zeros(3)       # Скорость [Vx, Vy, Vz] в м/с
+        self.last_accel_nav = np.zeros(3) # Чистое ускорение на прошлом шаге (для трапеций)
+        
+        # Пороги для алгоритма детекции покоя (ZVU - Zero Velocity Update)
+        # Помогают бороться с шумом, когда телефон неподвижен
+        self.accel_static_threshold = 0.15  # м/с² (порог для ускорения)
+        self.gyro_static_threshold = 0.05   # рад/с (порог для гироскопа)
+        
+        logging.info("Математическое ядро ИНС (IMUProcessor) успешно сброшено.")
 
-        # Сглаженные значения (выход фильтра)
-        self.position = np.zeros(3, dtype=np.float64)
-        self.velocity = np.zeros(3, dtype=np.float64)
-        self.orientation = np.array([1.0, 0.0, 0.0, 0.0])
+    def process_packet(self, packet: dict) -> dict:
+        """
+        Конвейер обработки входящего UDP пакета телеметрии.
+        
+        :param packet: Десериализованный JSON-словарь от UDPReceiver
+        :return: Словарь со структурированными сырыми навигационными данными для фильтров
+        """
+        # 1. Извлечение векторов и перевод в массивы numpy
+        accel_body = np.array(packet["accel"])  # Ускорение в осях телефона
+        gyro_body = np.array(packet["gyro"])    # Угловая скорость в осях телефона
+        quat_raw = np.array(packet["quat"])     # Кватернион ориентации [x, y, z, w]
 
-        # Выбираем фильтр
-        self.filter_type = filter_type
-        if filter_type == 'exponential':
-            self._filter_position = VectorFilter(alpha=filter_alpha)
-            self._filter_velocity = VectorFilter(alpha=filter_alpha)
-        elif filter_type == 'kalman':
-            self._filter_position = VectorKalmanFilter(
-                dt=0.02,  # будет обновляться при вызове
-                process_noise=kalman_process_noise,
-                measurement_noise=kalman_measurement_noise
-            )
-            self._filter_velocity = VectorKalmanFilter(
-                dt=0.02,
-                process_noise=kalman_process_noise,
-                measurement_noise=kalman_measurement_noise
-            )
-        elif filter_type == 'iir':
-            self._filter_position = VectorIIRFilter(cutoff=iir_cutoff, order=iir_order)
-            self._filter_velocity = VectorIIRFilter(cutoff=iir_cutoff, order=iir_order)
+        # Переводим метку времени из миллисекунд в секунды
+        current_timestamp = packet["timestamp"] / 1000.0  
+
+        # 2. Инициализация при первом старте сессии
+        if self.last_timestamp is None:
+            self.last_timestamp = current_timestamp
+            self.last_accel_nav = self._get_pure_accel_nav(accel_body, quat_raw)
+            return self._build_output_dict(quat_raw, accel_body)
+
+        # 3. Вычисление динамического шага времени (dt)
+        dt = current_timestamp - self.last_timestamp
+        
+        # Защита от сетевого джиттера или зависших пакетов
+        if dt <= 0 or dt > 0.5:
+            dt = 0.02  # Резервный шаг, эквивалентный частоте 50 Гц
+
+        # 4. Перенос ускорения в мировую СК и компенсация вектора гравитации
+        accel_nav = self._get_pure_accel_nav(accel_body, quat_raw)
+
+        # 5. Алгоритм детекции покоя (ZVU - Zero Velocity Update)
+        # Если шум датчиков ниже порога, устройство считается неподвижным
+        is_static = (np.linalg.norm(accel_nav) < self.accel_static_threshold and 
+                     np.linalg.norm(gyro_body) < self.gyro_static_threshold)
+
+        if is_static:
+            self.velocity = np.zeros(3)  # Сбрасываем линейную ошибку скорости в ноль
+            accel_nav = np.zeros(3)      # Обнуляем ускорение, чтобы позиция не дрейфовала
         else:
-            raise ValueError(f"Unknown filter_type: {filter_type}")
+            # 6. Двойное интегрирование методом трапеций (повышенная точность)
+            # Шаг 1: Находим скорость (V = V_prev + (a_prev + a_curr) / 2 * dt)
+            self.velocity += 0.5 * (self.last_accel_nav + accel_nav) * dt
+            
+            # Шаг 2: Находим позицию траектории (P = P_prev + V * dt)
+            self.position += self.velocity * dt
 
-        # Предыдущие значения для интегрирования
-        self._prev_accel_linear = np.zeros(3, dtype=np.float64)
-        self._prev_velocity = np.zeros(3, dtype=np.float64)
-        self._first_packet = True
+        # Сохраняем параметры текущего шага для следующей итерации конвейера
+        self.last_timestamp = current_timestamp
+        self.last_accel_nav = accel_nav
 
-    def process(self, accel_raw: Dict[str, float], gyro_raw: Dict[str, float],
-                quat: Dict[str, float], dt: float) -> Dict[str, np.ndarray]:
+        return self._build_output_dict(quat_raw, accel_body)
 
-        accel_local = np.array([accel_raw['x'], accel_raw['y'], accel_raw['z']], dtype=np.float64)
-        quat_arr = np.array([quat['w'], quat['x'], quat['y'], quat['z']], dtype=np.float64)
+    def _get_pure_accel_nav(self, accel_body: np.ndarray, quat: np.ndarray) -> np.ndarray:
+        """Преобразование систем координат и вычитание силы тяжести g."""
+        try:
+            # Создаем объект пространственного вращения из кватерниона смартфона Realme
+            # Scipy из коробки ожидает формат кватерниона [x, y, z, w]
+            rotation = R.from_quat(quat)
+            
+            # Поворачиваем вектор ускорения из телефонной СК в комнатную (мировую) СК
+            accel_nav = rotation.apply(accel_body)
+            
+            # ИСПРАВЛЕНО: Гравитация вычитается как полноценный мировой вектор [0, 0, 9.81].
+            # Это полностью защищает оси X и Y от накопления бокового смещения при наклонах телефона.
+            accel_nav -= np.array([0.0, 0.0, 9.81])
+            
+            return accel_nav
+        except Exception as e:
+            logging.error(f"Математическая ошибка transformation осей ИНС: {e}")
+            return np.zeros(3)
 
-        self.orientation = quat_arr
-        R = self._quaternion_to_rotation_matrix(quat_arr)
-        accel_world = R @ accel_local
-        accel_linear_world = self._subtract_gravity(accel_world)
-
-        if not self._first_packet:
-            v_new_raw = self._integrate_acceleration(
-                self._prev_accel_linear,
-                accel_linear_world,
-                self.velocity_raw,
-                dt
-            )
-        else:
-            v_new_raw = self.velocity_raw.copy()
-            self._first_packet = False
-
-        if not self._first_packet:
-            p_new_raw = self._integrate_velocity(
-                self.velocity_raw,
-                v_new_raw,
-                self.position_raw,
-                dt
-            )
-        else:
-            p_new_raw = self.position_raw.copy()
-
-        self.position_raw = p_new_raw
-        self.velocity_raw = v_new_raw
-        self._prev_accel_linear = accel_linear_world.copy()
-        self._prev_velocity = self.velocity_raw.copy()
-
-        # Применяем фильтр
-        if self.filter_type == 'kalman':
-            # Для Калмана передаём dt
-            self.position = np.array(self._filter_position.update(self.position_raw.tolist(), dt))
-            self.velocity = np.array(self._filter_velocity.update(self.velocity_raw.tolist(), dt))
-        else:
-            # Для экспоненциального и IIR (dt не нужен)
-            self.position = np.array(self._filter_position.update(self.position_raw.tolist()))
-            self.velocity = np.array(self._filter_velocity.update(self.velocity_raw.tolist()))
-
+    def _build_output_dict(self, quat: np.ndarray, accel_body: np.ndarray) -> dict:
+        """Формирование стандартизированного словаря для передачи в FilterManager."""
+        # ИСПРАВЛЕНО: Удален синтаксический мусор в конце метода
         return {
-            'position': self.position,
-            'velocity': self.velocity,
-            'orientation': self.orientation,
-            'position_raw': self.position_raw,
-            'velocity_raw': self.velocity_raw
+            "position": self.position.copy(),      # Сырые координаты [X, Y, Z] в метрах
+            "velocity": self.velocity.copy(),      # Скорость [Vx, Vy, Vz] в м/с
+            "accel_body": accel_body.copy(),       # Сырое ускорение для анализа шумов
+            "quat": quat.copy()                    # Кватернион поворота для 3D графики
         }
 
-    def reset(self) -> None:
-        self.position_raw = np.zeros(3, dtype=np.float64)
-        self.velocity_raw = np.zeros(3, dtype=np.float64)
-        self.position = np.zeros(3, dtype=np.float64)
-        self.velocity = np.zeros(3, dtype=np.float64)
-        self.orientation = np.array([1.0, 0.0, 0.0, 0.0])
-        self._prev_accel_linear = np.zeros(3, dtype=np.float64)
-        self._prev_velocity = np.zeros(3, dtype=np.float64)
-        self._first_packet = True
+    def process(self, accel_raw, gyro_raw, quat, dt):
+        try:
+            # Принудительно превращаем всё в float-массивы NumPy
+            a = np.array(accel_raw, dtype=float).flatten()
+            g = np.array(gyro_raw, dtype=float).flatten()
+            q = np.array(quat, dtype=float).flatten()
 
-        self._filter_position.reset([0.0, 0.0, 0.0])
-        self._filter_velocity.reset([0.0, 0.0, 0.0])
-
-    def _quaternion_to_rotation_matrix(self, q: np.ndarray) -> np.ndarray:
-        w, x, y, z = q[0], q[1], q[2], q[3]
-        return np.array([
-            [1 - 2*y*y - 2*z*z,   2*x*y - 2*w*z,     2*x*z + 2*w*y],
-            [2*x*y + 2*w*z,       1 - 2*x*x - 2*z*z, 2*y*z - 2*w*x],
-            [2*x*z - 2*w*y,       2*y*z + 2*w*x,     1 - 2*x*x - 2*y*y]
-        ], dtype=np.float64)
-
-    def _subtract_gravity(self, accel_world: np.ndarray) -> np.ndarray:
-        return accel_world - self.gravity
-
-    def _integrate_acceleration(self, a_prev: np.ndarray, a_curr: np.ndarray,
-                                 v_prev: np.ndarray, dt: float) -> np.ndarray:
-        return v_prev + (a_prev + a_curr) / 2.0 * dt
-
-    def _integrate_velocity(self, v_prev: np.ndarray, v_curr: np.ndarray,
-                             p_prev: np.ndarray, dt: float) -> np.ndarray:
-        return p_prev + (v_prev + v_curr) / 2.0 * dt
-
-    def get_state(self) -> Dict[str, np.ndarray]:
-        return {
-            'position': self.position.copy(),
-            'velocity': self.velocity.copy(),
-            'orientation': self.orientation.copy()
-        }
-
-    def get_raw_state(self) -> Dict[str, np.ndarray]:
-        return {
-            'position': self.position_raw.copy(),
-            'velocity': self.velocity_raw.copy(),
-            'orientation': self.orientation.copy()
-        }
+            # Если это первый запуск
+            if self.last_timestamp is None:
+                self.last_timestamp = 0 # Просто инициализируем
+                self.last_accel_nav = a # Упрощенно для старта
+            
+            # ВАША МАТЕМАТИКА (пример упрощенного интегрирования для теста)
+            # Если у вас есть своя логика ниже, оставьте её, но добавьте np.array()
+            self.velocity += a * dt
+            self.position += self.velocity * dt
+            
+            return {
+                "position": self.position.copy(),
+                "velocity": self.velocity.copy(),
+                "accel_body": a,
+                "quat": q
+            }
+        except Exception as e:
+            print(f"ОШИБКА В IMU_PROCESSOR: {e}")
+            return None

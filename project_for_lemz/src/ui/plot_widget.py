@@ -1,175 +1,180 @@
 """
 Виджет для отображения графиков фильтров на основе matplotlib.
 Встраивается в customtkinter через FigureCanvasTkAgg.
+Поддерживает динамическое переключение между 3D-траекторией и 2D-осями времени.
 """
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 import customtkinter as ctk
-from typing import Dict, List, Optional
+import numpy as np
+from collections import deque
+from typing import Dict
 
-# Цвета для разных фильтров
+# Конфигурация стилей согласно ТЗ (ключи строго согласованы с FilterManager и main.py)
 FILTER_COLORS = {
-    'raw': 'gray',
-    'exponential': 'blue',
-    'kalman': 'green',
-    'iir': 'red'
+    'RAW': 'gray',
+    'EXP': 'blue',
+    'IIR': 'red',
+    'KALMAN': 'green'
 }
 
-# Стили линий
 FILTER_STYLES = {
-    'raw': '--',
-    'exponential': '-',
-    'kalman': '-.',
-    'iir': ':'
+    'RAW': '--',
+    'EXP': '-',
+    'IIR': ':',
+    'KALMAN': '-.'
+}
+
+FILTER_LABELS = {
+    'RAW': 'Сырые данные (RAW)',
+    'EXP': 'Экспоненциальный',
+    'IIR': 'БИХ-фильтр (IIR)',
+    'KALMAN': 'Фильтр Калмана'
 }
 
 
 class PlotWidget(ctk.CTkFrame):
-    """
-    Виджет для отображения графика с несколькими линиями (по фильтрам).
-    """
-
-    def __init__(
-        self,
-        master,
-        width: int = 800,
-        height: int = 600,
-        xlabel: str = "Время (пакеты)",
-        ylabel: str = "Позиция X (м)",
-        axis: str = 'x'  # 'x', 'y', 'z'
-    ):
+    def __init__(self, master, width: int = 800, height: int = 600, max_points: int = 10000):
         """
-        :param master: родительский виджет (CTkFrame или CTk)
-        :param width: ширина виджета
-        :param height: высота виджета
-        :param xlabel: подпись оси X
-        :param ylabel: подпись оси Y
-        :param axis: какая ось отображается ('x', 'y', 'z')
+        Оптимизированный виджет визуализации траекторий ИНС девайса Realme.
         """
         super().__init__(master, width=width, height=height)
         self.pack_propagate(False)
 
-        self.xlabel = xlabel
-        self.ylabel = ylabel
-        self.axis = axis  # 'x', 'y', 'z'
+        self.max_points = max_points
+        self.view_mode = "3D"  # Текущий режим отображения: "3D", "X", "Y", "Z"
+        
+        # Настройки видимости каналов фильтрации (по умолчанию включены все)
+        self.visible_filters = {key: True for key in FILTER_COLORS.keys()}
 
-        # Данные: для каждого фильтра список значений (по оси Y)
-        self.data: Dict[str, List[float]] = {
-            'raw': [],
-            'exponential': [],
-            'kalman': [],
-            'iir': []
-        }
-        # Время (номер пакета) – общее для всех
-        self.time_values: List[int] = []
+        # Высокоэффективное хранилище истории точек на базе очередей deque (фиксированная длина)
+        self.history: Dict[str, deque] = {key: deque(maxlen=self.max_points) for key in FILTER_COLORS.keys()}
+        self.time_steps = deque(maxlen=self.max_points)  # Индексы пакетов времени
+        self.packet_index = 0
 
-        # Какие фильтры сейчас видны
-        self.visible_filters: List[str] = ['raw', 'exponential', 'kalman', 'iir']
-
-        # Создаём фигуру и оси
-        self.fig, self.ax = plt.subplots(figsize=(width/100, height/100), dpi=100)
-        self.fig.subplots_adjust(left=0.1, right=0.95, top=0.95, bottom=0.1)
-
-        # Настройка осей
-        self.ax.set_xlabel(self.xlabel)
-        self.ax.set_ylabel(self.ylabel)
-        self.ax.grid(True, linestyle='--', alpha=0.6)
-        self.ax.set_title("Сравнение фильтров")
-
-        # Встраиваем холст в customtkinter
+        # Инициализация контейнера под фигуру Matplotlib
+        self.fig = plt.figure(figsize=(width/100, height/100), dpi=100)
         self.canvas = FigureCanvasTkAgg(self.fig, master=self)
         self.canvas_widget = self.canvas.get_tk_widget()
         self.canvas_widget.pack(fill="both", expand=True)
 
-        # Словарь для хранения объектов линий (для обновления)
-        self.lines: Dict[str, Optional[plt.Line2D]] = {name: None for name in self.data.keys()}
+        self.ax = None
+        self.lines: Dict[str, plt.Line2D] = {}
 
-    def add_data_point(self, filter_name: str, value: float, time: int) -> None:
-        """
-        Добавляет новую точку для указанного фильтра.
+        # Первичное построение графического окна
+        self._rebuild_axes()
 
-        :param filter_name: имя фильтра ('raw', 'exponential', 'kalman', 'iir')
-        :param value: значение позиции по выбранной оси (Y)
-        :param time: номер пакета (время) – общий для всех фильтров
-        """
-        if filter_name not in self.data:
-            return  # игнорируем неизвестный фильтр
+    def _rebuild_axes(self):
+        """Пересборка сцены при смене режима (3D <-> 2D). Очистка тяжелых элементов осей."""
+        self.fig.clear()
+        self.lines.clear()
 
-        # Если это первый пакет, инициализируем список времени
-        if len(self.time_values) == 0:
-            self.time_values.append(time)
+        if self.view_mode == "3D":
+            # Инициализация трехмерного пространства
+            self.ax = self.fig.add_subplot(111, projection='3d')
+            self.ax.set_xlabel("Позиция X (м)")
+            self.ax.set_ylabel("Позиция Y (м)")
+            self.ax.set_zlabel("Позиция Z (м)")
         else:
-            # Добавляем время только если оно новое (если пакет приходит с новым номером)
-            if time != self.time_values[-1]:
-                self.time_values.append(time)
+            # Инициализация двухмерных осей времени
+            self.ax = self.fig.add_subplot(111)
+            self.ax.set_xlabel("Время (пакеты)")
+            self.ax.set_ylabel(f"Позиция {self.view_mode} (м)")
+            self.ax.grid(True, linestyle='--', alpha=0.5)
 
-        # Добавляем значение для данного фильтра
-        self.data[filter_name].append(value)
+        self.ax.set_title("Сравнение траекторий и алгоритмов фильтрации")
 
-        # Если длина данных для этого фильтра превышает 10000, усекаем (чтобы не переполнять память)
-        max_points = 10000
-        if len(self.data[filter_name]) > max_points:
-            self.data[filter_name] = self.data[filter_name][-max_points:]
-            # Также усекаем время, если оно стало длиннее данных
-            if len(self.time_values) > max_points:
-                self.time_values = self.time_values[-max_points:]
+        # Создаем постоянные объекты линий ОДИН раз во избежание утечки памяти процессора
+        for key in FILTER_COLORS.keys():
+            color = FILTER_COLORS[key]
+            style = FILTER_STYLES[key]
+            label = FILTER_LABELS[key]
 
-    def set_visible_filters(self, filter_names: List[str]) -> None:
-        """Устанавливает, какие фильтры отображать на графике."""
-        self.visible_filters = filter_names
+            if self.view_mode == "3D":
+                line, = self.ax.plot([], [], [], color=color, linestyle=style, linewidth=1.8, label=label)
+            else:
+                line, = self.ax.plot([], [], color=color, linestyle=style, linewidth=1.8, label=label)
+            
+            line.set_visible(self.visible_filters[key])
+            self.lines[key] = line
 
-    def update_plot(self) -> None:
-        """Перерисовывает график с текущими данными и видимыми фильтрами."""
-        # Очищаем оси (но не удаляем настройки)
-        self.ax.clear()
-        self.ax.set_xlabel(self.xlabel)
-        self.ax.set_ylabel(self.ylabel)
-        self.ax.grid(True, linestyle='--', alpha=0.6)
-        self.ax.set_title("Сравнение фильтров")
-
-        # Если нет данных, просто показываем пустой график
-        if len(self.time_values) == 0:
-            self.canvas.draw()
-            return
-
-        # Для каждого фильтра, который должен быть виден, строим линию
-        for filter_name in self.visible_filters:
-            if filter_name not in self.data:
-                continue
-            y_data = self.data[filter_name]
-            if len(y_data) == 0:
-                continue
-            # Берём только те точки, которые соответствуют длине y_data
-            x_data = self.time_values[:len(y_data)]
-            color = FILTER_COLORS.get(filter_name, 'black')
-            style = FILTER_STYLES.get(filter_name, '-')
-            label = filter_name.capitalize()  # для легенды
-            self.ax.plot(x_data, y_data, color=color, linestyle=style,
-                         linewidth=2, label=label)
-
-        # Легенда
-        self.ax.legend(loc='upper left')
-
-        # Масштабирование осей
-        self.ax.relim()
-        self.ax.autoscale_view()
-
-        # Перерисовываем холст
+        self.ax.legend(loc="upper left")
+        self.fig.tight_layout()
         self.canvas.draw()
 
-    def clear_plot(self) -> None:
-        """Очищает все данные и график."""
-        for key in self.data:
-            self.data[key].clear()
-        self.time_values.clear()
-        self.update_plot()
+    def add_data_point(self, filtered_packet: dict) -> None:
+        """
+        Приём отфильтрованной пачки координат от FilterManager.
+        Вызывается внутри высокоскоростного цикла check_queue в main.py.
+        """
+        self.time_steps.append(self.packet_index)
+        self.packet_index += 1
 
-    def set_axis(self, axis: str) -> None:
+        # Распределяем массивы координат [X, Y, Z] по очередям deque
+        for key in self.history.keys():
+            if key in filtered_packet:
+                self.history[key].append(filtered_packet[key].copy())
+
+    def update_plots(self) -> None:
         """
-        Устанавливает, какая ось отображается (x, y, z).
-        Обновляет подпись оси Y.
+        Высокоскоростное обновление линий БЕЗ полной очистки ax.clear() экрана.
         """
-        self.axis = axis
-        self.ylabel = f"Позиция {axis.upper()} (м)"
-        self.ax.set_ylabel(self.ylabel)
-        self.update_plot()
+        if len(self.time_steps) == 0:
+            return
+
+        has_data = False
+        t_data = np.array(self.time_steps)
+
+        # Меняем массивы точек внутри объектов линий напрямую (летучее обновление)
+        for key, line in self.lines.items():
+            if not self.visible_filters[key] or len(self.history[key]) == 0:
+                line.set_visible(False)
+                continue
+
+            line.set_visible(True)
+            has_data = True
+            pts = np.array(self.history[key])
+
+            if self.view_mode == "3D":
+                line.set_data(pts[:, 0], pts[:, 1])
+                line.set_3d_properties(pts[:, 2])
+            else:
+                axis_idx = {"X": 0, "Y": 1, "Z": 2}[self.view_mode]
+                line.set_data(t_data, pts[:, axis_idx])
+
+        if has_data:
+            self.ax.relim()
+            self.ax.autoscale_view()
+            # Легкая ленивая перерисовка экрана
+            self.canvas.draw_idle()
+
+    def toggle_filters_visibility(self, filter_mask: dict) -> None:
+        """Включение/выключение линий на основе чекбоксов из главного окна."""
+        for key in self.visible_filters.keys():
+            if key in filter_mask:
+                self.visible_filters[key] = filter_mask[key]
+        self.update_plots()
+
+    def change_view_mode(self, new_mode: str) -> None:
+        """Переключение проекции графиков (3D, X, Y, Z). Вызывается радиокнопками."""
+        if self.view_mode == new_mode:
+            return
+        self.view_mode = new_mode
+        self._rebuild_axes()
+        self.update_plots()
+
+    def clear_plots(self) -> None:
+        """Полная очистка графиков и сброс истории (вызывается кнопкой 'Сбросить')."""
+        for queue_obj in self.history.values():
+            queue_obj.clear()
+        self.time_steps.clear()
+        self.packet_index = 0
+        
+        for line in self.lines.values():
+            if self.view_mode == "3D":
+                line.set_data([], [])
+                line.set_3d_properties([])
+            else:
+                line.set_data([], [])
+
+        self.canvas.draw_idle()
