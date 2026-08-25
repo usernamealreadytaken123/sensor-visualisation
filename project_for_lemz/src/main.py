@@ -219,7 +219,6 @@ class VOnTR_App(ctk.CTk):
         self.processor.reset()
         self.filter_manager.reset()
         
-        # Безопасный вызов метода очистки в зависимости от версии вашего PlotWidget
         if hasattr(self.plot_widget, 'clear_plot'):
             self.plot_widget.clear_plot()
         else:
