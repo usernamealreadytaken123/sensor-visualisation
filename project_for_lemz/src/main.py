@@ -251,9 +251,6 @@ class VOnTR_App(ctk.CTk):
                     self.data_queue.task_done()
                     continue
 
-                import numpy as np
-                
-                # Универсальная распаковка векторов (поддерживает списки и словари эмулятора)
                 acc_data = packet["accel"]
                 if isinstance(acc_data, dict):
                     accel_raw = [float(acc_data.get('x', 0)), float(acc_data.get('y', 0)), float(acc_data.get('z', 0))]
@@ -280,7 +277,6 @@ class VOnTR_App(ctk.CTk):
                 raw_data = self.processor.process(accel_raw, gyro_raw, quat, dt)
                 
                 if raw_data:
-                    # Накладываем каскад фильтров FilterManager
                     filtered_data = self.filter_manager.apply_filters(raw_data)
                     
                     # Передаем отфильтрованные точки в массивы вашего PlotWidget
@@ -308,7 +304,6 @@ class VOnTR_App(ctk.CTk):
             except Exception as e:
                 print(f"СБОЙ КОНВЕЙЕРА В MAIN: {e}")
 
-        # Обновление холста при наличии новых точек
         if packets_processed > 0:
             self.counter_label.configure(text=f"Принято пакетов: {self.packet_count}")
             if hasattr(self.plot_widget, 'update_plot'):
@@ -316,13 +311,8 @@ class VOnTR_App(ctk.CTk):
             else:
                 self.plot_widget.update_plots()
 
-        # Рекурсивный перезапуск функции опроса очереди
         if self.is_gathering:
             self._queue_timer_id = self.after(20, self.check_queue)
-
-    # =====================================================================
-    # СЛУШАТЕЛИ GUI-ЭЛЕМЕНТОВ УПРАВЛЕНИЯ
-    # =====================================================================
 
     def _on_filter_changed(self):
         """Считывание чекбоксов и передача маски видимости линий графиков."""
