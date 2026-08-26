@@ -1,17 +1,16 @@
-"""
-Модуль фильтрации данных.
-Поддерживаемые фильтры:
-- Exponential (экспоненциальное сглаживание)
-- Kalman (одномерный фильтр Калмана для позиции и скорости)
-- IIR (БИХ-фильтр Баттерворта 2-го порядка) – требует scipy
-"""
+# Модуль фильтрации данных.
+# Поддерживаемые фильтры:
+# - Exponential (экспоненциальное сглаживание)
+# - Kalman (одномерный фильтр Калмана для позиции и скорости)
+# - IIR (БИХ-фильтр Баттерворта 2-го порядка) – требует scipy
+
 import numpy as np
 from typing import List, Optional
 
 # ===================== Базовые фильтры =====================
 
 class ExponentialSmoothing:
-    """Экспоненциальное сглаживание (первый порядок)"""
+    # Экспоненциальное сглаживание (первый порядок)
     def __init__(self, alpha: float = 0.3, initial_value: float = 0.0):
         self.alpha = alpha
         self.value = initial_value
@@ -39,9 +38,7 @@ class KalmanFilter1D:
     Состояние: [position, velocity]^T
     Измерение: position
     """
-    def __init__(self, dt: float = 0.02, process_noise: float = 1e-4,
-                 measurement_noise: float = 1e-2, initial_pos: float = 0.0,
-                 initial_vel: float = 0.0):
+    def __init__(self, dt: float = 0.02, process_noise: float = 1e-4, measurement_noise: float = 1e-2, initial_pos: float = 0.0, initial_vel: float = 0.0):
         self.dt = dt
         self.Q = np.array([[process_noise * dt**3 / 3, process_noise * dt**2 / 2],
                            [process_noise * dt**2 / 2, process_noise * dt]], dtype=np.float64)
@@ -140,8 +137,7 @@ class VectorFilter:
 
 class VectorKalmanFilter:
     """Обёртка для фильтра Калмана (по одному на ось)."""
-    def __init__(self, dt: float = 0.02, process_noise: float = 1e-4,
-                 measurement_noise: float = 1e-2):
+    def __init__(self, dt: float = 0.02, process_noise: float = 1e-4, measurement_noise: float = 1e-2):
         self.dt = dt
         self.process_noise = process_noise
         self.measurement_noise = measurement_noise

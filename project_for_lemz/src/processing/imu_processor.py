@@ -1,6 +1,5 @@
-"""
-Математическое ядро VIO с поддержкой разных фильтров.
-"""
+# Математическое ядро VIO с поддержкой разных фильтров.
+
 import numpy as np
 import logging
 from scipy.spatial.transform import Rotation as R
@@ -41,14 +40,16 @@ class IMUProcessor:
         gyro_body = np.array(packet["gyro"])    # Угловая скорость в осях телефона
         quat_raw = np.array(packet["quat"])     # Кватернион ориентации [x, y, z, w]
 
-        # Переводим метку времени из миллисекунд в секунды
-        current_timestamp = packet["timestamp"] / 1000.0  
+        # Метка времени уже в секундах
+        current_timestamp = packet["timestamp"]  
 
         # 2. Инициализация при первом старте сессии
         if self.last_timestamp is None:
             self.last_timestamp = current_timestamp
             self.last_accel_nav = self._get_pure_accel_nav(accel_body, quat_raw)
-            return self._build_output_dict(quat_raw, accel_body)
+            output = self._build_output_dict(quat_raw, accel_body)
+            output["dt"] = 0.02  # Начальный дефолтный шаг
+            return output
 
         # 3. Вычисление динамического шага времени (dt)
         dt = current_timestamp - self.last_timestamp
@@ -80,60 +81,36 @@ class IMUProcessor:
         self.last_timestamp = current_timestamp
         self.last_accel_nav = accel_nav
 
-        return self._build_output_dict(quat_raw, accel_body)
+        # Формируем выходной пакет и подмешиваем dt для менеджера фильтров
+        output = self._build_output_dict(quat_raw, accel_body)
+        output["dt"] = dt 
+        return output
 
     def _get_pure_accel_nav(self, accel_body: np.ndarray, quat: np.ndarray) -> np.ndarray:
         """Преобразование систем координат и вычитание силы тяжести g."""
         try:
-            # Создаем объект пространственного вращения из кватерниона смартфона Realme
-            # Scipy из коробки ожидает формат кватерниона [x, y, z, w]
+            # Создаем объект пространственного вращения из кватерниона смартфона
+            # Scipy ожидает формат кватерниона [x, y, z, w]
             rotation = R.from_quat(quat)
             
-            # Поворачиваем вектор ускорения из телефонной СК в комнатную (мировую) СК
+            # Поворачиваем вектор ускорения из телефонной СК в мировую СК
             accel_nav = rotation.apply(accel_body)
             
-            # ИСПРАВЛЕНО: Гравитация вычитается как полноценный мировой вектор [0, 0, 9.81].
-            # Это полностью защищает оси X и Y от накопления бокового смещения при наклонах телефона.
+            # Гравитация вычитается как полноценный мировой вектор [0, 0, 9.81].
+            # Это защищает оси X и Y от накопления бокового смещения при наклонах телефона.
             accel_nav -= np.array([0.0, 0.0, 9.81])
             
             return accel_nav
         except Exception as e:
-            logging.error(f"Математическая ошибка transformation осей ИНС: {e}")
+            logging.error(f"Математическая ошибка трансформации осей ИНС: {e}")
             return np.zeros(3)
 
     def _build_output_dict(self, quat: np.ndarray, accel_body: np.ndarray) -> dict:
         """Формирование стандартизированного словаря для передачи в FilterManager."""
-        # ИСПРАВЛЕНО: Удален синтаксический мусор в конце метода
         return {
+            "timestamp": self.last_timestamp,
             "position": self.position.copy(),      # Сырые координаты [X, Y, Z] в метрах
             "velocity": self.velocity.copy(),      # Скорость [Vx, Vy, Vz] в м/с
             "accel_body": accel_body.copy(),       # Сырое ускорение для анализа шумов
             "quat": quat.copy()                    # Кватернион поворота для 3D графики
         }
-
-    def process(self, accel_raw, gyro_raw, quat, dt):
-        try:
-            # Принудительно превращаем всё в float-массивы NumPy
-            a = np.array(accel_raw, dtype=float).flatten()
-            g = np.array(gyro_raw, dtype=float).flatten()
-            q = np.array(quat, dtype=float).flatten()
-
-            # Если это первый запуск
-            if self.last_timestamp is None:
-                self.last_timestamp = 0 # Просто инициализируем
-                self.last_accel_nav = a # Упрощенно для старта
-            
-            # ВАША МАТЕМАТИКА (пример упрощенного интегрирования для теста)
-            # Если у вас есть своя логика ниже, оставьте её, но добавьте np.array()
-            self.velocity += a * dt
-            self.position += self.velocity * dt
-            
-            return {
-                "position": self.position.copy(),
-                "velocity": self.velocity.copy(),
-                "accel_body": a,
-                "quat": q
-            }
-        except Exception as e:
-            print(f"ОШИБКА В IMU_PROCESSOR: {e}")
-            return None

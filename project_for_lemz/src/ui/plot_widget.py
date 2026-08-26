@@ -1,8 +1,7 @@
-"""
-Виджет для отображения графиков фильтров на основе matplotlib.
-Встраивается в customtkinter через FigureCanvasTkAgg.
-Поддерживает динамическое переключение между 3D-траекторией и 2D-осями времени.
-"""
+# Виджет для отображения графиков фильтров на основе matplotlib.
+# Встраивается в customtkinter через FigureCanvasTkAgg.
+# Поддерживает динамическое переключение между 3D-траекторией и 2D-осями времени.
+
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 import customtkinter as ctk
@@ -103,17 +102,13 @@ class PlotWidget(ctk.CTkFrame):
         self.canvas.draw()
 
     def add_data_point(self, filtered_packet: dict) -> None:
-        """
-        Приём отфильтрованной пачки координат от FilterManager.
-        Вызывается внутри высокоскоростного цикла check_queue в main.py.
-        """
         self.time_steps.append(self.packet_index)
         self.packet_index += 1
 
-        # Распределяем массивы координат [X, Y, Z] по очередям deque
         for key in self.history.keys():
             if key in filtered_packet:
-                self.history[key].append(filtered_packet[key].copy())
+                # Убираем .copy(), так как данные уже являются копиями
+                self.history[key].append(filtered_packet[key])
 
     def update_plots(self) -> None:
         """
