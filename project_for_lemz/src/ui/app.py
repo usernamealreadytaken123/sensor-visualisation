@@ -37,6 +37,8 @@ class VOnTR_App(ctk.CTk):
 
         self._create_widgets()
 
+        self.protocol("WM_DELETE_WINDOW", self.on_closing)
+
     def _set_controls_state(self, state: str):
         """Включение/выключение элементов управления."""
         self.cb_raw.configure(state=state)
@@ -284,6 +286,36 @@ class VOnTR_App(ctk.CTk):
         except Exception as e:
             self.status_label.configure(text="Статус: Ошибка экспорта!", text_color="red")
             logging.error(f"Ошибка экспорта Excel с графиками по столбцам: {e}")
+
+    def on_closing(self):
+        """Безопасное завершение всех процессов и таймеров при закрытии приложения."""
+        logging.info("Инициализировано безопасное закрытие приложения...")
+        
+        # 1. Принудительно останавливаем сбор данных и уничтожаем таймер check_queue
+        self.is_gathering = False
+        if self._queue_timer_id is not None:
+            self.after_cancel(self._queue_timer_id)
+            self._queue_timer_id = None
+
+        # 2. Корректно глушим фоновый сетевой поток UDP сокета
+        if self.receiver:
+            try:
+                self.receiver.stop()
+            except Exception as e:
+                logging.error(f"Ошибка при остановке сокета во время закрытия: {e}")
+            self.receiver = None
+
+        # 3. Отменяем абсолютно ВСЕ оставшиеся системные after-таймеры CustomTkinter
+        # (включая check_dpi_scaling, анимации фокуса, мерцания курсора и т.д.)
+        for after_id in self.tk.eval('after info').split():
+            try:
+                self.after_cancel(after_id)
+            except Exception:
+                pass
+
+        # 4. Уничтожаем окно и полностью освобождаем ресурсы ОС
+        self.destroy()
+        logging.info("Приложение успешно и чисто завершило работу.")
 
 
     def _create_widgets(self):
