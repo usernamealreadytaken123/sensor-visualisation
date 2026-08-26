@@ -5,7 +5,7 @@ import customtkinter as ctk
 import openpyxl
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 
-# Импорты модулей системы (src уже в sys.path из main.py)
+# Импорты модулей системы 
 from network.udp_receiver import UDPReceiver
 from processing.imu_processor import IMUProcessor
 from processing.filter_manager import FilterManager
@@ -171,7 +171,6 @@ class VOnTR_App(ctk.CTk):
         self.update()
 
         try:
-            # Строгий импорт компонентов графиков openpyxl внутри метода
             from openpyxl.chart import LineChart, Reference
             from openpyxl.chart.series import SeriesLabel
             
@@ -179,7 +178,6 @@ class VOnTR_App(ctk.CTk):
             ws = wb.active
             ws.title = "Данные одометрии"
 
-            # 1. Стилизация таблицы данных
             font_title = Font(name="Segoe UI", size=14, bold=True, color="1F6AA5")
             font_header = Font(name="Segoe UI", size=10, bold=True, color="FFFFFF")
             fill_header = PatternFill(start_color="1F6AA5", end_color="1F6AA5", fill_type="solid")
@@ -190,14 +188,14 @@ class VOnTR_App(ctk.CTk):
                 bottom=Side(style='thin', color='E0E0E0')
             )
 
-            # 2. Главный заголовок отчета
+            # Главный заголовок
             ws.merge_cells("A1:M1")
             ws["A1"] = "АНАЛИТИЧЕСКИЙ ОТЧЕТ СИСТЕМЫ ФИЛЬТРАЦИИ ИНС ВОнТР"
             ws["A1"].font = font_title
             ws["A1"].alignment = Alignment(horizontal="center", vertical="center")
             ws.row_dimensions.height = 30
 
-            # 3. Структура верхней шапки таблицы
+            # Структура верхней шапки таблицы
             headers = [
                 ("A3:A4", "№ Точки"),
                 ("B3:D3", "Сырые данные (RAW)"),
@@ -214,12 +212,12 @@ class VOnTR_App(ctk.CTk):
                         cell.border = thin_border
                         cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
                 
-                # Запись текста строго в первую ячейку диапазона шапки
+                # Фикс: берем координату первой ячейки
                 first_cell_coord = cell_range.split(":")[0]
                 ws[first_cell_coord].value = text
                 ws[first_cell_coord].font = font_header
 
-            # 4. Подзаголовки осей пространства (Строка 4)
+            # Подзаголовки осей пространства (Строка 4)
             sub_headers = ["X", "Y", "Z"]
             for f_idx in range(4):
                 for axis_idx, axis_name in enumerate(sub_headers):
@@ -232,12 +230,11 @@ class VOnTR_App(ctk.CTk):
 
             ws["A4"].border = thin_border
 
-            # Задаем фиксированную ширину колонок для таблицы данных
             for col_idx in range(1, 14):
                 col_letter = openpyxl.utils.get_column_letter(col_idx)
                 ws.column_dimensions[col_letter].width = 12
 
-            # 5. Циклическое заполнение таблицы навигационными точками ИНС
+            # Заполнение данными
             for row_idx, data_point in enumerate(self.export_data, start=5):
                 p_cell = ws.cell(row=row_idx, column=1, value=data_point["packet_id"])
                 p_cell.alignment = Alignment(horizontal="center")
@@ -251,54 +248,43 @@ class VOnTR_App(ctk.CTk):
                         cell.border = thin_border
                         cell.number_format = '0.0000' 
 
-            max_row = len(self.export_data) + 4  # Последняя строка с данными
+            max_row = len(self.export_data) + 4
             filter_names = ["RAW", "EXP", "IIR", "KALMAN"]
-
-            # Список стартовых буквенных колонок для размещения графиков по столбцам (справа от таблицы)
-            # Столбец O (15), Столбец Y (25), Столбец AI (35)
             graph_columns = ["O3", "Y3", "AI3"]
 
-            # 6. ГЕНЕРАЦИЯ ГРАФИКОВ ПО СТОЛБЦАМ (В РЯД)
+            # Генерация графиков по столбцам (справа от таблицы)
             for axis_idx, axis_name in enumerate(["X", "Y", "Z"]):
                 chart = LineChart()
                 chart.title = f"Сравнение фильтрации — Ось {axis_name}"
-                chart.style = 13  # Нативный плоский стиль Excel
+                chart.style = 13  
                 chart.y_axis.title = f"Позиция {axis_name} (м)"
                 chart.x_axis.title = "Время (пакеты)"
-                chart.width = 16   # Ширина блока графика в Excel
-                chart.height = 11  # Высота блока графика в Excel
+                chart.width = 16   
+                chart.height = 11  
                 
-                # Добавляем 4 линии (RAW, EXP, IIR, KALMAN) на текущий график оси
                 for f_idx, filter_label in enumerate(filter_names):
-                    # Вычисляем точный номер столбца данных для текущей оси и фильтра
                     target_col = 2 + (f_idx * 3) + axis_idx
-                    
-                    # Создаем ссылку на диапазон (строго со строки 5, чтобы исключить наложение заголовков букв)
+                    # Ссылка строго со строки 5, отключив titles_from_data
                     data_ref = Reference(ws, min_col=target_col, min_row=5, max_row=max_row)
-                    
-                    # Добавляем данные без автоматического вытягивания названий, настроим вручную
                     chart.add_data(data_ref, titles_from_data=False)
                     
-                    # Жесткое переопределение легенды через SeriesLabel (устраняет баги openpyxl)
+                    # Фикс: оборачиваем строку в SeriesLabel для прохождения валидации openpyxl
                     chart.series[f_idx].title = SeriesLabel(v=filter_label)
                 
-                # Задаем подписи горизонтальной оси времени (Берем из колонки А "№ Точки")
                 cats_ref = Reference(ws, min_col=1, min_row=5, max_row=max_row)
                 chart.set_categories(cats_ref)
                 
-                # Помещаем график в зарезервированный столбец текущей итерации
                 target_anchor = graph_columns[axis_idx]
                 ws.add_chart(chart, target_anchor)
 
-            # 7. Запись готовой книги на постоянный диск
             filename = f"vontr_export_{int(time.time())}.xlsx"
             wb.save(filename)
-
             self.status_label.configure(text=f"Успех: Данные и ГРАФИКИ сохранены в {filename}", text_color="green")
 
         except Exception as e:
             self.status_label.configure(text="Статус: Ошибка экспорта!", text_color="red")
             logging.error(f"Ошибка экспорта Excel с графиками по столбцам: {e}")
+
 
     def _create_widgets(self):
         """Создание и компоновка всех элементов интерфейса."""
@@ -375,7 +361,7 @@ class VOnTR_App(ctk.CTk):
         self.axis_title = ctk.CTkLabel(self.axis_frame, text="Отображаемые оси", font=ctk.CTkFont(weight="bold"))
         self.axis_title.grid(row=0, column=0, sticky="w", padx=15, pady=(8, 4))
 
-        self.axis_var = ctk.StringVar(value="X")
+        self.axis_var = ctk.StringVar(value="3D")
         self.rb_3d = ctk.CTkRadioButton(self.axis_frame, text="3D Траектория", state="disabled", variable=self.axis_var, value="3D", command=self._on_axis_changed)
         self.rb_3d.grid(row=1, column=0, sticky="w", padx=15, pady=3)
         self.rb_x = ctk.CTkRadioButton(self.axis_frame, text="Ось X (Времени)", state="disabled", variable=self.axis_var, value="X", command=self._on_axis_changed)
